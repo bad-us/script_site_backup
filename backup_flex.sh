@@ -1,27 +1,13 @@
 #!/bin/bash
 ################################################################################
-# backup_flex.sh — ГИБКИЙ FULL/INCR backup (GNU tar incremental) v4.2-minimal
+# backup_flex.sh — ГИБКИЙ FULL/INCR backup (GNU tar incremental) v4.3
 #
-# Изменения относительно исходника:
-#  - добавлен переключатель уведомлений: telegram/email/both/none
-#  - добавлена отправка уведомлений на email через SMTP
-#  - для SMTP используется AUTH=LOGIN
-#  - остальная логика максимально сохранена
-# 
 # Возможности:
-#  - FULL в выбранные дни недели + в выбранные часы (может быть несколько)
-#  - INCR в выбранные дни недели + в выбранные часы (может быть несколько)
-#  - Папки: YYYY-MM-DD_HH-MM-SS
-#  - Инкременты привязаны к последнему FULL через chain (tar snapshot .snar)
-#  - Ретеншн: удаляет старые full/incremental/chains старше N дней
-#
-# Запуск:
-#  ./backup_flex.sh --mode full
-#  ./backup_flex.sh --mode incr
-#  ./backup_flex.sh --mode auto        # сам определит по расписанию из conf
-#
-# Рекомендовано:
-#  запускать по systemd timers (каждый timer вызывает нужный --mode)
+#  - FULL в выбранные дни недели + в выбранные часы
+#  - INCR в выбранные дни недели + в выбранные часы
+#  - GNU tar incremental через chain/.snar
+#  - Уведомления: Telegram / Email / оба / none
+#  - SFTP: сначала ключ, потом пароль (если SFTP_AUTH_MODE=auto)
 ################################################################################
 
 set -euo pipefail
@@ -32,9 +18,18 @@ CONF="/home/admin2/backup/backup_flex.conf"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --mode) MODE="$2"; shift 2;;
-    --conf) CONF="$2"; shift 2;;
-    *) echo "Unknown arg: $1"; exit 2;;
+    --mode)
+      MODE="$2"
+      shift 2
+      ;;
+    --conf)
+      CONF="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown arg: $1"
+      exit 2
+      ;;
   esac
 done
 
@@ -52,6 +47,13 @@ AUTO_TOLERANCE_MIN="${AUTO_TOLERANCE_MIN:-2}"
 RETENTION_DAYS="${RETENTION_DAYS:-14}"
 NOTIFY_MODE="${NOTIFY_MODE:-telegram}"
 SMTP_SCHEME="${SMTP_SCHEME:-starttls}"
+SFTP_AUTH_MODE="${SFTP_AUTH_MODE:-auto}"
+SFTP_KEY_FILE="${SFTP_KEY_FILE:-}"
+
+# если массив исключений не задан
+if ! declare -p TAR_EXCLUDES >/dev/null 2>&1; then
+  TAR_EXCLUDES=()
+fi
 
 # ----------------------- dirs --------------------------
 DIR_FULL="${BACKUP_BASE}/full"
@@ -63,10 +65,15 @@ mkdir -p "$DIR_FULL" "$DIR_INCR" "$DIR_CHAINS" "$DIR_LOGS"
 
 TS="$(date +%Y-%m-%d_%H-%M-%S)"
 DATE_HUMAN="$(date '+%d.%m.%Y %H:%M:%S')"
-DOW="$(date +%u)"          # 1..7
+DOW="$(date +%u)"
 HM="$(date +%H:%M)"
 
 LOG_FILE="${DIR_LOGS}/backup_${TS}.log"
+
+CHAIN_ID="-"
+DB_SIZE="-"
+SITE_SIZE="-"
+SFTP_STATUS="не выполнялся"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -94,6 +101,7 @@ send_email() {
   [[ -n "${SMTP_PORT:-}" ]] || return 0
   [[ -n "${MAIL_FROM:-}" ]] || return 0
   [[ -n "${MAIL_TO:-}" ]] || return 0
+  [[ -n "${SMTP_USER:-}" ]] || return 0
 
   mail_file="$(mktemp)"
 
@@ -112,62 +120,35 @@ EOF
   case "${SMTP_SCHEME}" in
     ssl)
       smtp_url="smtps://${SMTP_HOST}:${SMTP_PORT}"
+      curl -s --url "$smtp_url" \
+        --user "${SMTP_USER}:${SMTP_PASS:-}" \
+        --login-options "AUTH=LOGIN" \
+        --mail-from "$MAIL_FROM" \
+        --mail-rcpt "$MAIL_TO" \
+        --upload-file "$mail_file" \
+        >/dev/null 2>&1 || true
       ;;
     none)
       smtp_url="smtp://${SMTP_HOST}:${SMTP_PORT}"
+      curl -s --url "$smtp_url" \
+        --user "${SMTP_USER}:${SMTP_PASS:-}" \
+        --login-options "AUTH=LOGIN" \
+        --mail-from "$MAIL_FROM" \
+        --mail-rcpt "$MAIL_TO" \
+        --upload-file "$mail_file" \
+        >/dev/null 2>&1 || true
       ;;
     *)
       smtp_url="smtp://${SMTP_HOST}:${SMTP_PORT}"
+      curl -s --url "$smtp_url" --ssl-reqd \
+        --user "${SMTP_USER}:${SMTP_PASS:-}" \
+        --login-options "AUTH=LOGIN" \
+        --mail-from "$MAIL_FROM" \
+        --mail-rcpt "$MAIL_TO" \
+        --upload-file "$mail_file" \
+        >/dev/null 2>&1 || true
       ;;
   esac
-
-  if [[ -n "${SMTP_USER:-}" ]]; then
-    if [[ "${SMTP_SCHEME}" == "ssl" ]]; then
-      curl -s --url "$smtp_url" \
-        --user "${SMTP_USER}:${SMTP_PASS:-}" \
-        --login-options "AUTH=LOGIN" \
-        --mail-from "$MAIL_FROM" \
-        --mail-rcpt "$MAIL_TO" \
-        --upload-file "$mail_file" \
-        >/dev/null 2>&1 || true
-    elif [[ "${SMTP_SCHEME}" == "none" ]]; then
-      curl -s --url "$smtp_url" \
-        --user "${SMTP_USER}:${SMTP_PASS:-}" \
-        --login-options "AUTH=LOGIN" \
-        --mail-from "$MAIL_FROM" \
-        --mail-rcpt "$MAIL_TO" \
-        --upload-file "$mail_file" \
-        >/dev/null 2>&1 || true
-    else
-      curl -s --url "$smtp_url" --ssl-reqd \
-        --user "${SMTP_USER}:${SMTP_PASS:-}" \
-        --login-options "AUTH=LOGIN" \
-        --mail-from "$MAIL_FROM" \
-        --mail-rcpt "$MAIL_TO" \
-        --upload-file "$mail_file" \
-        >/dev/null 2>&1 || true
-    fi
-  else
-    if [[ "${SMTP_SCHEME}" == "ssl" ]]; then
-      curl -s --url "$smtp_url" \
-        --mail-from "$MAIL_FROM" \
-        --mail-rcpt "$MAIL_TO" \
-        --upload-file "$mail_file" \
-        >/dev/null 2>&1 || true
-    elif [[ "${SMTP_SCHEME}" == "none" ]]; then
-      curl -s --url "$smtp_url" \
-        --mail-from "$MAIL_FROM" \
-        --mail-rcpt "$MAIL_TO" \
-        --upload-file "$mail_file" \
-        >/dev/null 2>&1 || true
-    else
-      curl -s --url "$smtp_url" --ssl-reqd \
-        --mail-from "$MAIL_FROM" \
-        --mail-rcpt "$MAIL_TO" \
-        --upload-file "$mail_file" \
-        >/dev/null 2>&1 || true
-    fi
-  fi
 
   rm -f "$mail_file"
 }
@@ -195,17 +176,67 @@ notify() {
   esac
 }
 
-die() {
-  local msg="$1"
-  log "✗ КРИТИЧЕСКАЯ ОШИБКА: $msg"
-  notify \
-    "ОШИБКА БЕКАПА $(hostname)" \
-    "ОШИБКА БЕКАПА
+notify_start_msg() {
+  local subject message
+
+  subject="Бекап запущен $(hostname)"
+  message="$(cat <<EOF
+Бекап запущен
+
+Хост: $(hostname)
+Дата: ${DATE_HUMAN}
+Mode: ${MODE}
+EOF
+)"
+
+  notify "$subject" "$message"
+}
+
+notify_done_msg() {
+  local subject message
+
+  subject="Бекап завершён $(hostname)"
+  message="$(cat <<EOF
+Бекап завершён
+
+Хост: $(hostname)
+Дата: ${DATE_HUMAN}
+Mode: ${MODE}
+Chain: ${CHAIN_ID}
+
+DB: ${DB_SIZE}
+SITE: ${SITE_SIZE}
+SFTP: ${SFTP_STATUS}
+
+Run: ${RUN_DIR}
+EOF
+)"
+
+  notify "$subject" "$message"
+}
+
+notify_error_msg() {
+  local err="$1"
+  local subject message
+
+  subject="ОШИБКА БЕКАПА $(hostname)"
+  message="$(cat <<EOF
+ОШИБКА БЕКАПА
 
 Хост: $(hostname)
 Дата: ${DATE_HUMAN}
 
-Ошибка: ${msg}"
+Ошибка: ${err}
+EOF
+)"
+
+  notify "$subject" "$message"
+}
+
+die() {
+  local msg="$1"
+  log "✗ КРИТИЧЕСКАЯ ОШИБКА: $msg"
+  notify_error_msg "$msg"
   exit 1
 }
 
@@ -213,24 +244,69 @@ filesize() {
   du -h "$1" 2>/dev/null | awk '{print $1}' || echo "?"
 }
 
+# ----------------------- SFTP helper --------------------
+sftp_run_batch() {
+  local batch_file="$1"
+
+  # Сначала пробуем по ключу
+  if [[ "$SFTP_AUTH_MODE" == "auto" || "$SFTP_AUTH_MODE" == "key" ]]; then
+    if [[ -n "$SFTP_KEY_FILE" && -f "$SFTP_KEY_FILE" ]]; then
+      sftp \
+        -i "$SFTP_KEY_FILE" \
+        -oBatchMode=yes \
+        -o PreferredAuthentications=publickey \
+        -o PasswordAuthentication=no \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=30 \
+        -P "$SFTP_PORT" \
+        -b "$batch_file" \
+        "${SFTP_USER}@${SFTP_HOST}" >>"$LOG_FILE" 2>&1 && return 0
+    fi
+
+    if [[ "$SFTP_AUTH_MODE" == "key" ]]; then
+      return 1
+    fi
+  fi
+
+  # Если ключ не сработал — пробуем пароль
+  if [[ "$SFTP_AUTH_MODE" == "auto" || "$SFTP_AUTH_MODE" == "password" ]]; then
+    sshpass -p "$SFTP_PASS" sftp \
+      -oBatchMode=no \
+      -o PreferredAuthentications=password \
+      -o PubkeyAuthentication=no \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=30 \
+      -P "$SFTP_PORT" \
+      -b "$batch_file" \
+      "${SFTP_USER}@${SFTP_HOST}" >>"$LOG_FILE" 2>&1 && return 0
+  fi
+
+  return 1
+}
+
 # ----------------------- schedule helpers --------------
 in_array() {
-  local needle="$1"; shift
-  for x in "$@"; do [[ "$x" == "$needle" ]] && return 0; done
+  local needle="$1"
+  shift
+  local x
+  for x in "$@"; do
+    [[ "$x" == "$needle" ]] && return 0
+  done
   return 1
 }
 
 time_matches() {
-  # true если текущее время HM совпадает с любым из списка TIMES с допуском ±AUTO_TOLERANCE_MIN
   local now_min target tol
   tol="$AUTO_TOLERANCE_MIN"
-  now_min=$((10#$(date +%H)*60 + 10#$(date +%M)))
+  now_min=$((10#$(date +%H) * 60 + 10#$(date +%M)))
 
   for target in "$@"; do
     local th tm tmin diff
     th="${target%:*}"
     tm="${target#*:}"
-    tmin=$((10#$th*60 + 10#$tm))
+    tmin=$((10#$th * 60 + 10#$tm))
     diff=$(( now_min - tmin ))
     (( diff < 0 )) && diff=$(( -diff ))
     if (( diff <= tol )); then
@@ -241,15 +317,16 @@ time_matches() {
 }
 
 decide_mode_auto() {
-  # FULL имеет приоритет, если попали в расписание FULL
   if in_array "$DOW" "${FULL_DAYS[@]}" && time_matches "${FULL_TIMES[@]}"; then
     echo "full"
     return
   fi
+
   if in_array "$DOW" "${INCR_DAYS[@]}" && time_matches "${INCR_TIMES[@]}"; then
     echo "incr"
     return
   fi
+
   echo "skip"
 }
 
@@ -267,13 +344,11 @@ if [[ "$MODE" != "full" && "$MODE" != "incr" ]]; then
 fi
 
 # ----------------------- chain logic --------------------
-# Каждому FULL соответствует chain (цепочка). INCR всегда пишет в текущую chain.
-# current -> симлинк на последнюю chain
 CHAIN_CURRENT_LINK="${DIR_CHAINS}/current"
 
 create_new_chain() {
   local chain_id chain_dir
-  chain_id="$TS"  # chain id = timestamp full backup
+  chain_id="$TS"
   chain_dir="${DIR_CHAINS}/${chain_id}"
   mkdir -p "$chain_dir"
   ln -sfn "$chain_dir" "$CHAIN_CURRENT_LINK"
@@ -299,9 +374,9 @@ mkdir -p "$RUN_DIR"
 DB_BACKUP="${RUN_DIR}/db_${MODE}_${TS}.sql.gz"
 SITE_BACKUP="${RUN_DIR}/site_${MODE}_${TS}.tar.gz"
 
-# ----------------------- start -------------------------
+# ----------------------- start --------------------------
 log "=========================================="
-log "  ЗАПУСК БЕКАПА v4.2-minimal"
+log "  ЗАПУСК БЕКАПА v4.3"
 log "  MODE: ${MODE} | DOW: ${DOW} | TIME: ${HM}"
 log "  RUN_DIR: ${RUN_DIR}"
 log "=========================================="
@@ -311,7 +386,7 @@ if [[ "$MODE" == "full" ]]; then
   CHAIN_ID="$(create_new_chain)"
   CHAIN_DIR="$(get_current_chain_dir)"
   SNAR_FILE="${CHAIN_DIR}/site.snar"
-  rm -f "$SNAR_FILE"  # reset snar for full
+  rm -f "$SNAR_FILE"
   log "Создана новая chain: ${CHAIN_ID}"
 else
   CHAIN_DIR="$(get_current_chain_dir)"
@@ -333,17 +408,12 @@ else
   log "Использую chain: ${CHAIN_ID}"
 fi
 
-notify \
-  "Бекап запущен $(hostname)" \
-  "Бекап запущен
-
-Хост: $(hostname)
-Дата: ${DATE_HUMAN}
-Mode: ${MODE}"
+notify_start_msg
 
 # ----------------------- DB backup ----------------------
 log "---- БЕКАП MySQL ----"
 rm -f "$DB_BACKUP"
+
 mysqldump -h "$DB_HOST" -P"$DB_PORT" -u "$DB_USER" -p"$DB_PASS" \
   --column-statistics=0 \
   --single-transaction \
@@ -368,47 +438,7 @@ tar --listed-incremental="$SNAR_FILE" \
 SITE_SIZE="$(filesize "$SITE_BACKUP")"
 log "✓ SITE OK: $(basename "$SITE_BACKUP") (${SITE_SIZE})"
 
-# Сохраним копию снапшота рядом с запуском (для удобства аудита)
 cp -f "$SNAR_FILE" "${RUN_DIR}/site.snar" 2>/dev/null || true
-
-# ----------------------- SFTP upload --------------------
-#log "---- SFTP UPLOAD ----"
-#SFTP_REMOTE_DIR="${SFTP_REMOTE_BASE}/${MODE}/${TS}"
-
-#SFTP_BATCH="$(mktemp)"
-#cat > "$SFTP_BATCH" <<EOF
-#-mkdir ${SFTP_REMOTE_BASE}
-#-mkdir ${SFTP_REMOTE_BASE}/full
-#-mkdir ${SFTP_REMOTE_BASE}/incr
-#-mkdir ${SFTP_REMOTE_BASE}/full
-#-mkdir ${SFTP_REMOTE_BASE}/incr
-#-mkdir ${SFTP_REMOTE_DIR}
-#cd ${SFTP_REMOTE_DIR}
-#put ${DB_BACKUP}
-#put ${SITE_BACKUP}
-#bye
-#EOF
-
-#SFTP_STATUS="ok"
-#sshpass -p "$SFTP_PASS" sftp \
-#  -o PreferredAuthentications=password \
-#  -o PubkeyAuthentication=no \
-#  -o StrictHostKeyChecking=no \
-#  -o ConnectTimeout=30 \
-#  -P "$SFTP_PORT" \
-#  -b "$SFTP_BATCH" \
-#  "${SFTP_USER}@${SFTP_HOST}" >>"$LOG_FILE" 2>&1 || SFTP_STATUS="ошибка"
-
-#SFTP_STATUS="ok"
-#sshpass -p "$SFTP_PASS" sftp \
-#  -o StrictHostKeyChecking=no \
-#  -o ConnectTimeout=30 \
-#  -P "$SFTP_PORT" \
-#  -b "$SFTP_BATCH" \
-#  "${SFTP_USER}@${SFTP_HOST}" >>"$LOG_FILE" 2>&1 || SFTP_STATUS="ошибка"
-
-#rm -f "$SFTP_BATCH"
-#log "SFTP: ${SFTP_STATUS}"
 
 # ----------------------- SFTP upload --------------------
 log "---- SFTP UPLOAD ----"
@@ -426,55 +456,32 @@ fi
 SFTP_BATCH="$(mktemp)"
 cat > "$SFTP_BATCH" <<EOF
 cd ${REMOTE_MODE_DIR}
--mkdir ${TS}
+mkdir ${TS}
 put ${DB_BACKUP} ${TS}/$(basename "$DB_BACKUP")
 put ${SITE_BACKUP} ${TS}/$(basename "$SITE_BACKUP")
 bye
 EOF
 
 SFTP_STATUS="ok"
-sshpass -p "$SFTP_PASS" sftp \
-  -oBatchMode=no \
-  -o PreferredAuthentications=password \
-  -o PubkeyAuthentication=no \
-  -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null \
-  -o ConnectTimeout=30 \
-  -P "$SFTP_PORT" \
-  -b "$SFTP_BATCH" \
-  "${SFTP_USER}@${SFTP_HOST}" >>"$LOG_FILE" 2>&1 || SFTP_STATUS="ошибка"
+sftp_run_batch "$SFTP_BATCH" || SFTP_STATUS="ошибка"
 
 rm -f "$SFTP_BATCH"
 log "SFTP: ${SFTP_STATUS}"
 
-
 # ----------------------- retention cleanup --------------
 log "---- RETENTION CLEANUP ----"
-find "$DIR_FULL" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" -exec rm -rf {} \; 2>>"$LOG_FILE" || true
-find "$DIR_INCR" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" -exec rm -rf {} \; 2>>"$LOG_FILE" || true
+find "$DIR_FULL"  -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" -exec rm -rf {} \; 2>>"$LOG_FILE" || true
+find "$DIR_INCR"  -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" -exec rm -rf {} \; 2>>"$LOG_FILE" || true
 find "$DIR_CHAINS" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" -exec rm -rf {} \; 2>>"$LOG_FILE" || true
 find "$DIR_LOGS" -type f -mtime +30 -delete 2>>"$LOG_FILE" || true
 
-# ----------------------- done --------------------------
+# ----------------------- done ---------------------------
 log "=========================================="
 log "  ГОТОВО"
 log "  MODE=${MODE} | chain=${CHAIN_ID}"
 log "  DB=${DB_SIZE} | SITE=${SITE_SIZE} | SFTP=${SFTP_STATUS}"
 log "=========================================="
 
-notify \
-  "Бекап завершён $(hostname)" \
-  "Бекап завершён
-
-Хост: $(hostname)
-Дата: ${DATE_HUMAN}
-Mode: ${MODE}
-Chain: ${CHAIN_ID}
-
-DB: ${DB_SIZE}
-SITE: ${SITE_SIZE}
-SFTP: ${SFTP_STATUS}
-
-Run: ${RUN_DIR}"
+notify_done_msg
 
 exit 0
