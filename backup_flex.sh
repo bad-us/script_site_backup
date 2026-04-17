@@ -95,19 +95,51 @@ send_telegram() {
 send_email() {
   local subject="$1"
   local body="$2"
-  local mail_file smtp_url
+  local smtp_url rcpt mail_file
+  local -a recipients=()
 
-  [[ -n "${SMTP_HOST:-}" ]] || return 0
-  [[ -n "${SMTP_PORT:-}" ]] || return 0
-  [[ -n "${MAIL_FROM:-}" ]] || return 0
-  [[ -n "${MAIL_TO:-}" ]] || return 0
-  [[ -n "${SMTP_USER:-}" ]] || return 0
+  [[ -n "${SMTP_HOST:-}" ]] || { log "Email skip: SMTP_HOST empty"; return 0; }
+  [[ -n "${SMTP_PORT:-}" ]] || { log "Email skip: SMTP_PORT empty"; return 0; }
+  [[ -n "${MAIL_FROM:-}" ]] || { log "Email skip: MAIL_FROM empty"; return 0; }
+  [[ -n "${SMTP_USER:-}" ]] || { log "Email skip: SMTP_USER empty"; return 0; }
 
-  mail_file="$(mktemp)"
+  # Новый способ: массив MAIL_TO_LIST
+  if declare -p MAIL_TO_LIST >/dev/null 2>&1; then
+    recipients=("${MAIL_TO_LIST[@]}")
+  # Старый способ: строка MAIL_TO, если массив не задан
+  elif [[ -n "${MAIL_TO:-}" ]]; then
+    while IFS= read -r rcpt; do
+      rcpt="$(printf '%s' "$rcpt" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [[ -n "$rcpt" ]] && recipients+=("$rcpt")
+    done < <(printf '%s' "$MAIL_TO" | tr ',;' '\n')
+  fi
 
-  cat > "$mail_file" <<EOF
+  if [[ ${#recipients[@]} -eq 0 ]]; then
+    log "Email skip: no recipients"
+    return 0
+  fi
+
+  case "${SMTP_SCHEME}" in
+    ssl)
+      smtp_url="smtps://${SMTP_HOST}:${SMTP_PORT}"
+      ;;
+    none)
+      smtp_url="smtp://${SMTP_HOST}:${SMTP_PORT}"
+      ;;
+    *)
+      smtp_url="smtp://${SMTP_HOST}:${SMTP_PORT}"
+      ;;
+  esac
+
+  for rcpt in "${recipients[@]}"; do
+    rcpt="$(printf '%s' "$rcpt" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -n "$rcpt" ]] || continue
+
+    mail_file="$(mktemp)"
+
+    cat > "$mail_file" <<EOF
 From: ${MAIL_FROM}
-To: ${MAIL_TO}
+To: ${rcpt}
 Subject: ${subject}
 Date: $(date -R)
 MIME-Version: 1.0
@@ -117,42 +149,49 @@ Content-Transfer-Encoding: 8bit
 ${body}
 EOF
 
-  case "${SMTP_SCHEME}" in
-    ssl)
-      smtp_url="smtps://${SMTP_HOST}:${SMTP_PORT}"
-      curl -s --url "$smtp_url" \
-        --user "${SMTP_USER}:${SMTP_PASS:-}" \
-        --login-options "AUTH=LOGIN" \
-        --mail-from "$MAIL_FROM" \
-        --mail-rcpt "$MAIL_TO" \
-        --upload-file "$mail_file" \
-        >/dev/null 2>&1 || true
-      ;;
-    none)
-      smtp_url="smtp://${SMTP_HOST}:${SMTP_PORT}"
-      curl -s --url "$smtp_url" \
-        --user "${SMTP_USER}:${SMTP_PASS:-}" \
-        --login-options "AUTH=LOGIN" \
-        --mail-from "$MAIL_FROM" \
-        --mail-rcpt "$MAIL_TO" \
-        --upload-file "$mail_file" \
-        >/dev/null 2>&1 || true
-      ;;
-    *)
-      smtp_url="smtp://${SMTP_HOST}:${SMTP_PORT}"
-      curl -s --url "$smtp_url" --ssl-reqd \
-        --user "${SMTP_USER}:${SMTP_PASS:-}" \
-        --login-options "AUTH=LOGIN" \
-        --mail-from "$MAIL_FROM" \
-        --mail-rcpt "$MAIL_TO" \
-        --upload-file "$mail_file" \
-        >/dev/null 2>&1 || true
-      ;;
-  esac
+    log "Email try: ${rcpt}"
 
-  rm -f "$mail_file"
+    if [[ "${SMTP_SCHEME}" == "ssl" ]]; then
+      if curl --silent --show-error --fail \
+        --url "$smtp_url" \
+        --user "${SMTP_USER}:${SMTP_PASS:-}" \
+        --login-options "AUTH=LOGIN" \
+        --mail-from "$MAIL_FROM" \
+        --mail-rcpt "$rcpt" \
+        --upload-file "$mail_file" >>"$LOG_FILE" 2>&1; then
+        log "Email OK: ${rcpt}"
+      else
+        log "Email FAIL: ${rcpt}"
+      fi
+    elif [[ "${SMTP_SCHEME}" == "none" ]]; then
+      if curl --silent --show-error --fail \
+        --url "$smtp_url" \
+        --user "${SMTP_USER}:${SMTP_PASS:-}" \
+        --login-options "AUTH=LOGIN" \
+        --mail-from "$MAIL_FROM" \
+        --mail-rcpt "$rcpt" \
+        --upload-file "$mail_file" >>"$LOG_FILE" 2>&1; then
+        log "Email OK: ${rcpt}"
+      else
+        log "Email FAIL: ${rcpt}"
+      fi
+    else
+      if curl --silent --show-error --fail \
+        --url "$smtp_url" --ssl-reqd \
+        --user "${SMTP_USER}:${SMTP_PASS:-}" \
+        --login-options "AUTH=LOGIN" \
+        --mail-from "$MAIL_FROM" \
+        --mail-rcpt "$rcpt" \
+        --upload-file "$mail_file" >>"$LOG_FILE" 2>&1; then
+        log "Email OK: ${rcpt}"
+      else
+        log "Email FAIL: ${rcpt}"
+      fi
+    fi
+
+    rm -f "$mail_file"
+  done
 }
-
 notify() {
   local subject="$1"
   local message="$2"
